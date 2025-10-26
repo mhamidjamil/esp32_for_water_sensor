@@ -53,7 +53,7 @@ void setup() {
   // Small delay to stabilize reading
   delay(50);
 
-  // Read pin state
+  // Read pin state for immediate detection (covers cold boot or manual reset)
   // When dry: pull-up keeps pin HIGH
   // When wet (water bridges to GND): pin reads LOW
   int pinState = digitalRead(WATER_DETECT_PIN);
@@ -62,10 +62,37 @@ void setup() {
                 WATER_DETECT_PIN,
                 pinState == LOW ? "LOW (WATER DETECTED)" : "HIGH (DRY)");
 
-  if (pinState == LOW) {
-    // Water detected! Send alert
+  // Determine wake reason (if any) from deep sleep
+  esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
+  switch (wakeReason) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      Serial.println("Woke from deep sleep by external (EXT0) wakeup - water pin triggered");
+      break;
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println("Woke from deep sleep by timer");
+      break;
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+    default:
+      Serial.println("Normal boot or unknown wakeup reason");
+      break;
+  }
+
+  // Decide whether to send alert:
+  // - If wake reason is EXT0 (pin triggered)
+  // - Or if pin reads LOW right now (covers cold boot / reset while water present)
+  bool shouldSendAlert = false;
+  if (wakeReason == ESP_SLEEP_WAKEUP_EXT0) {
+    shouldSendAlert = true;
+  } else if (pinState == LOW) {
+    // If pin is low at startup, treat as water detected and send alert
+    shouldSendAlert = true;
+  }
+
+  if (shouldSendAlert) {
     Serial.println("Water detected! Connecting to WiFi and sending alert...");
-    
+    // Turn LED on while sending
+    digitalWrite(LED_PIN, HIGH);
+
     if (connectWiFi()) {
       bool alertSent = sendWaterAlert();
       if (alertSent) {
@@ -84,7 +111,6 @@ void setup() {
       Serial.println("WiFi connection failed - cannot send alert");
     }
   } else {
-    // No water detected
     Serial.println("No water detected. Going to deep sleep...");
   }
 
@@ -95,11 +121,17 @@ void setup() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  Serial.printf("Entering deep sleep for %llu seconds...\n", DEEP_SLEEP_DURATION_US / 1000000ULL);
+  Serial.printf("Configuring deep sleep (pin + timer). Will sleep for %llu seconds unless pin triggers wake...\n", DEEP_SLEEP_DURATION_US / 1000000ULL);
   Serial.flush();
 
-  // Configure deep sleep and enter
+  // Configure EXT0 wake: wake when WATER_DETECT_PIN goes LOW (water bridges to GND)
+  // Note: EXT0 requires the pin to be an RTC GPIO (GPIO25 is RTC-capable on most ESP32 boards)
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)WATER_DETECT_PIN, 0); // 0 = wake on LOW
+
+  // Also set a timer wake as a fallback to periodically check
   esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION_US);
+
+  // Enter deep sleep
   esp_deep_sleep_start();
 }
 
